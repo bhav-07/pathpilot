@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -15,6 +17,8 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/proxy"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 type ContainerInfo struct {
@@ -24,22 +28,88 @@ type ContainerInfo struct {
 }
 
 const (
-	PROXY_PORT = "8000"
+	PROXY_PORT     = "8000"
+	MaxLogFileSize = 10 * 1024 * 1024
 )
 
 var (
 	containerMap = make(map[string]ContainerInfo)
 	mapMutex     sync.RWMutex
+	logger       *zap.SugaredLogger
+	logFile      *os.File
 )
 
-func main() {
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+func init() {
+	var err error
+	logFile, err = setupLogFile()
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to set up log file: %v", err))
 	}
 
-	if err := initializeContainerMap(dockerClient); err != nil {
-		log.Printf("Error initializing container map: %v", err)
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderConfig),
+		zapcore.AddSync(logFile),
+		getLogLevel(),
+	)
+
+	baseLogger := zap.New(core)
+	logger = baseLogger.Sugar()
+
+	logger.Infow("Logger initialized", "logfile", logFile.Name())
+}
+
+func setupLogFile() (*os.File, error) {
+	logDir := os.Getenv("LOG_DIR")
+	if logDir == "" {
+		logDir = "logs"
+	}
+
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	logPath := filepath.Join(logDir, "pathpilot.log")
+
+	// Check if the file exists and its size
+	if info, err := os.Stat(logPath); err == nil {
+		if info.Size() > MaxLogFileSize {
+			// Delete the old log file if it's too big
+			if err := os.Remove(logPath); err != nil {
+				return nil, fmt.Errorf("failed to delete old log file: %w", err)
+			}
+		}
+	}
+
+	// Open the log file in append mode, create it if it doesn't exist
+	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+}
+
+func getLogLevel() zapcore.Level {
+	level := os.Getenv("LOG_LEVEL")
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		return zapcore.DebugLevel
+	case "INFO":
+		return zapcore.InfoLevel
+	case "WARN":
+		return zapcore.WarnLevel
+	case "ERROR":
+		return zapcore.ErrorLevel
+	default:
+		return zapcore.InfoLevel
+	}
+}
+
+func main() {
+	defer logger.Sync()
+	defer logFile.Close()
+
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		logger.Fatalf("Failed to create Docker client: %v", err)
 	}
 
 	go listenDockerEvents(dockerClient)
@@ -51,12 +121,16 @@ func main() {
 	setupReverseProxy(reverseProxy)
 
 	go func() {
-		log.Println("PathPilot API is running on PORT 8080")
-		log.Fatal(pathpilotAPI.Listen(":8080"))
+		logger.Infof("PathPilot API is running on PORT 8080")
+		if err := pathpilotAPI.Listen(":8080"); err != nil {
+			logger.Fatalf("Failed to start PathPilot API: %v", err)
+		}
 	}()
 
-	log.Printf("PathPilot is running on PORT %s", PROXY_PORT)
-	log.Fatal(reverseProxy.Listen(":" + PROXY_PORT))
+	logger.Infof("PathPilot is running on PORT %s", PROXY_PORT)
+	if err := reverseProxy.Listen(":" + PROXY_PORT); err != nil {
+		logger.Fatalf("Failed to start reverse proxy: %v", err)
+	}
 }
 
 func setupPathPilotAPI(app *fiber.App, dockerClient *client.Client) {
@@ -93,6 +167,10 @@ func setupPathPilotAPI(app *fiber.App, dockerClient *client.Client) {
 			return c.Status(fiber.StatusInternalServerError).SendString("Error running container")
 		}
 
+		logger.Infow("Container created",
+			"image", imageWithTag,
+			"containerID", resp.ID)
+
 		return c.JSON(fiber.Map{
 			"status":    "success",
 			"container": fmt.Sprintf("%s.localhost:%s", resp.ID, PROXY_PORT),
@@ -116,13 +194,20 @@ func setupReverseProxy(app *fiber.App) {
 
 		info, exists := getContainerInfo(subdomain)
 		if !exists {
+			logger.Warnw("Container not found", "subdomain", subdomain)
 			return c.Status(404).SendString("Container not found")
 		}
 
 		proxyURL := fmt.Sprintf("http://%s:%s", info.IPAddress, info.DefaultPort)
-		log.Printf("Forwarding %s:%s -> %s", hostname, PROXY_PORT, proxyURL)
+		logger.Infow("Forwarding request",
+			"from", fmt.Sprintf("%s:%s", hostname, PROXY_PORT),
+			"to", proxyURL)
 
 		if err := proxy.Do(c, proxyURL); err != nil {
+			logger.Errorw("Proxy request failed",
+				"error", err,
+				"from", fmt.Sprintf("%s:%s", hostname, PROXY_PORT),
+				"to", proxyURL)
 			return err
 		}
 
@@ -133,13 +218,15 @@ func setupReverseProxy(app *fiber.App) {
 func initializeContainerMap(cli *client.Client) error {
 	containers, err := cli.ContainerList(context.Background(), container.ListOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	for _, c := range containers {
 		containerInfo, err := cli.ContainerInspect(context.Background(), c.ID)
 		if err != nil {
-			log.Printf("Error inspecting container %s: %v", c.ID, err)
+			logger.Errorw("Error inspecting container",
+				"containerID", c.ID,
+				"error", err)
 			continue
 		}
 
@@ -171,8 +258,10 @@ func initializeContainerMap(cli *client.Client) error {
 		}
 		mapMutex.Unlock()
 
-		log.Printf("Initialized container: %s.localhost:%s --> http://%s:%s",
-			name, PROXY_PORT, ipAddress, defaultPort)
+		logger.Infow("Initialized container",
+			"name", name,
+			"proxyAddress", fmt.Sprintf("%s.localhost:%s", name, PROXY_PORT),
+			"containerAddress", fmt.Sprintf("http://%s:%s", ipAddress, defaultPort))
 	}
 
 	return nil
@@ -305,6 +394,10 @@ func processEvent(cli *client.Client, event events.Message) {
 			containerName, PROXY_PORT, ipAddress, defaultPort)
 
 		fmt.Printf("Event: %s, ID: %s, Action: %s\n", event.Status, event.ID, event.Action)
+		logger.Infow("Container started",
+			"name", containerName,
+			"proxyAddress", fmt.Sprintf("%s.localhost:%s", containerName, PROXY_PORT),
+			"containerAddress", fmt.Sprintf("http://%s:%s", ipAddress, defaultPort))
 	} else if event.Type == "container" && event.Action == "die" {
 
 		containerName := event.Actor.Attributes["name"]
@@ -312,7 +405,8 @@ func processEvent(cli *client.Client, event events.Message) {
 		delete(containerMap, containerName)
 		mapMutex.Unlock()
 
-		log.Printf("Container stopped and removed from map: %s", containerName)
+		logger.Infow("Container stopped and removed from map",
+			"name", containerName)
 	}
 }
 
