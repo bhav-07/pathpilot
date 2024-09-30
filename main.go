@@ -393,7 +393,7 @@ func pullDockerImage(cli *client.Client, imageName string) error {
 func runDockerContainer(cli *client.Client, imageName string) (container.CreateResponse, error) {
 	containerConfig := &container.Config{
 		Image: imageName,
-		// Tty:   false,
+		Tty:   false,
 	}
 
 	hostConfig := &container.HostConfig{
