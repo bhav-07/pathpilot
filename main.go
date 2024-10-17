@@ -238,19 +238,20 @@ func setupPathPilotAPI(dockerClient *client.Client) *fiber.App {
 			}
 		}
 
-		resp, err := runDockerContainer(dockerClient, imageWithTag)
+		containerName, redirectURL, err := runDockerContainer(dockerClient, imageWithTag)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "Error running container")
 		}
-
 		logger.Infow("Container created",
 			"image", imageWithTag,
-			"containerID", resp.ID)
+			"containerName", containerName, "redirestUrl", redirectURL)
 
 		return c.JSON(fiber.Map{
-			"status":    "success",
-			"container": fmt.Sprintf("%s.localhost:%s", resp.ID, cfg.ProxyPort),
+			"status":        "success",
+			"containerName": containerName,
+			"redirectURL":   redirectURL,
 		})
+
 	})
 
 	app.Get("/container/:name", func(c *fiber.Ctx) error {
@@ -390,7 +391,7 @@ func pullDockerImage(cli *client.Client, imageName string) error {
 	return nil
 }
 
-func runDockerContainer(cli *client.Client, imageName string) (container.CreateResponse, error) {
+func runDockerContainer(cli *client.Client, imageName string) (string, string, error) {
 	containerConfig := &container.Config{
 		Image: imageName,
 		Tty:   false,
@@ -400,19 +401,30 @@ func runDockerContainer(cli *client.Client, imageName string) (container.CreateR
 		AutoRemove: true,
 	}
 
-	// Create the container
 	resp, err := cli.ContainerCreate(context.Background(), containerConfig, hostConfig, nil, nil, "")
 	if err != nil {
-		return container.CreateResponse{}, err
+		return "", "", err
 	}
 
-	// Start the container
 	if err := cli.ContainerStart(context.Background(), resp.ID, container.StartOptions{}); err != nil {
-		return container.CreateResponse{}, err
+		return "", "", err
 	}
 
-	log.Printf("Container %s started", resp.ID)
-	return resp, nil
+	containerInfo, err := cli.ContainerInspect(context.Background(), resp.ID)
+	if err != nil {
+		return "", "", err
+	}
+
+	containerName := strings.TrimPrefix(containerInfo.Name, "/")
+
+	redirectURL := fmt.Sprintf("%s.localhost:%s", containerName, cfg.ProxyPort)
+
+	logger.Infow("Container started",
+		"id", resp.ID,
+		"name", containerName,
+		"redirectURL", redirectURL)
+
+	return containerName, redirectURL, nil
 }
 
 func listenDockerEvents(cli *client.Client) {
