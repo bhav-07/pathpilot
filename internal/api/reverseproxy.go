@@ -26,7 +26,7 @@ func SetupReverseProxy(lggr *zap.SugaredLogger, cfg *config.Config) *fiber.App {
 
 		proxyURL := fmt.Sprintf("http://%s:%s", info.IPAddress, info.DefaultPort)
 		lggr.Infow("Forwarding request",
-			"from", fmt.Sprintf(hostname),
+			"from", hostname,
 			"to", proxyURL)
 
 		if err := proxy.Do(c, proxyURL); err != nil {
